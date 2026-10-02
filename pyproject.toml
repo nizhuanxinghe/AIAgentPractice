@@ -1,0 +1,9 @@
+[project]
+name = "ai-learning"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "gradio>=5.0.0",
+]
