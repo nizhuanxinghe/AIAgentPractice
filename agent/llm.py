@@ -104,13 +104,13 @@ def get_client(provider: str = "bailian") -> OpenAI:
     return OpenAI(api_key=api_key, base_url=cfg["base_url"])
 
 
-def chat(
+def stream(
     messages: list[dict],
     provider: str = "bailian",
     model: str | None = None,
     temperature: float = 0.5,
     max_tokens: int = 1024,
-) -> str:
+):
     cfg = PROVIDERS[provider]
     client = get_client(provider)
     try:
@@ -119,7 +119,31 @@ def chat(
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            stream=True,
         )
-        return response.choices[0].message.content or ""
+        for chunk in response:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta.content or ""
+            if delta:
+                yield delta
     except Exception as exc:
         raise map_api_error(exc) from exc
+
+
+def chat(
+    messages: list[dict],
+    provider: str = "bailian",
+    model: str | None = None,
+    temperature: float = 0.5,
+    max_tokens: int = 1024,
+) -> str:
+    return "".join(
+        stream(
+            messages,
+            provider=provider,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    )

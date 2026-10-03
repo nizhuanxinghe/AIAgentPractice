@@ -22,13 +22,18 @@ def respond(message, history, agent, model_label, temperature, max_tokens):
     message = (message or "").strip()
     history = list(history or [])
     if not message:
-        return "", history, agent
+        yield "", history, agent
+        return
     if agent is None:
         agent = _make_agent(model_label, temperature, max_tokens)
-    reply = agent.run(message)
-    history.append({"role": "user", "content": message})
-    history.append({"role": "assistant", "content": reply})
-    return "", history, agent
+    history = history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": ""},
+    ]
+    yield "", history, agent
+    for partial in agent.stream(message):
+        history = history[:-1] + [{"role": "assistant", "content": partial}]
+        yield "", history, agent
 
 
 def on_settings_change(model_label, temperature, max_tokens):
