@@ -8,6 +8,8 @@ from langchain_core._api import LangChainDeprecationWarning
 warnings.filterwarnings("ignore", category=LangChainDeprecationWarning)
 
 from . import llm
+from .answer_cache import get_answer_cache
+from .documents import get_document_store
 from .chain import step, stop
 from .prompt import EXTRACT_SYSTEM, looks_like_persona, parse_slots, render_output
 from .tools import run_tool
@@ -188,16 +190,57 @@ class Agent:
                 yield shown
         return text
 
+    def _reuse_answer(self, user_input: str) -> str | None:
+        if _asks_time(user_input):
+            return None
+        try:
+            found = get_answer_cache().lookup(user_input)
+        except Exception as exc:
+            logger.info("向量检索失败: %s", exc)
+            return None
+        if not found:
+            return None
+        answer, score = found
+        self.remember(user_input, answer)
+        logger.info("复用答案 相似度: %.3f", score)
+        self._log_output(answer)
+        return answer
+
+    def _store_answer(self, user_input: str, reply: str) -> None:
+        if _asks_time(user_input) or reply.startswith("错误"):
+            return
+        try:
+            get_answer_cache().add(user_input, reply)
+        except Exception as exc:
+            logger.info("写入向量库失败: %s", exc)
+
+    def _document_context(self, user_input: str) -> str:
+        try:
+            return get_document_store().context(user_input)
+        except Exception as exc:
+            logger.info("文档检索失败: %s", exc)
+            return ""
+
     def stream(self, user_input: str):
         logger.info("输入: %s", user_input)
         try:
-            if looks_like_persona(user_input):
+            context = self._document_context(user_input)
+            if not context:
+                reused = self._reuse_answer(user_input)
+                if reused:
+                    yield reused
+                    return
+            if not context and looks_like_persona(user_input):
                 reply = persona_chain.invoke({"agent": self, "text": user_input})
                 if reply:
+                    self._store_answer(user_input, reply)
                     self._log_output(reply)
                     yield reply
                     return
-            self._turn.append({"role": "user", "content": user_input})
+            prompt = user_input
+            if context:
+                prompt = f"{user_input}\n\n参考文档片段：\n{context}"
+            self._turn.append({"role": "user", "content": prompt})
             text = yield from self._stream_visible()
             tool = _tool_name(text)
             if tool == "get_current_time" and _asks_time(user_input):
@@ -217,6 +260,8 @@ class Agent:
             shown = _visible_text(text) or "请换种说法再试一次。"
             yield shown
             self.remember(user_input, shown)
+            if not context:
+                self._store_answer(user_input, shown)
             self._log_output(shown)
         except llm.LLMError as exc:
             self._turn.clear()
