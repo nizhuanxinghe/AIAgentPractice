@@ -7,4 +7,5 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "gradio>=5.0.0",
     "langchain-classic>=1.0.0",
+    "langchain-openai>=1.0.0",
 ]

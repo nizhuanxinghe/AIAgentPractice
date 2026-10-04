@@ -1,6 +1,8 @@
 import gradio as gr
+import logging
 
 from agent import Agent
+from agent.embeddings import EMBEDDINGS, cosine_similarity, embed_documents
 from agent.llm import MODEL_CHOICES
 
 DEFAULT_MODEL = "百炼 / qwen-plus"
@@ -44,6 +46,27 @@ def clear(model_label, temperature, max_tokens):
     return "", [], _make_agent(model_label, temperature, max_tokens)
 
 
+EMBED_CHOICES = {
+    "百炼 / text-embedding-v3": "bailian",
+    "OpenAI / text-embedding-3-small": "openai",
+    "Ollama / qwen2.5:3b": "ollama",
+}
+
+
+def compare_embeddings(left, right, embed_label):
+    left = (left or "").strip()
+    right = (right or "").strip()
+    if not left or not right:
+        return "请填写两段文本"
+    provider = EMBED_CHOICES[embed_label]
+    logging.getLogger("agent").info("嵌入输入: %s | %s", left, right)
+    vectors = embed_documents([left, right], provider=provider)
+    score = cosine_similarity(vectors[0], vectors[1])
+    logging.getLogger("agent").info("余弦相似度: %.3f", score)
+    model = EMBEDDINGS[provider]["model"]
+    return f"模型: {model}\n维度: {len(vectors[0])}\n余弦相似度: {score:.3f}"
+
+
 with gr.Blocks(title="AI Agent") as demo:
     gr.Markdown("## AI Agent")
     agent_state = gr.State(None)
@@ -75,6 +98,23 @@ with gr.Blocks(title="AI Agent") as demo:
         [msg, chatbot, agent_state],
     )
     clear_btn.click(clear, settings, [msg, chatbot, agent_state])
+
+    gr.Markdown("## 文本嵌入")
+    embed_dd = gr.Dropdown(
+        choices=list(EMBED_CHOICES.keys()),
+        value="百炼 / text-embedding-v3",
+        label="嵌入模型",
+    )
+    with gr.Row():
+        embed_left = gr.Textbox(label="文本 A", value="我爱你")
+        embed_right = gr.Textbox(label="文本 B", value="I love you")
+    embed_btn = gr.Button("比较相似度")
+    embed_out = gr.Textbox(label="结果", lines=3)
+    embed_btn.click(
+        compare_embeddings,
+        [embed_left, embed_right, embed_dd],
+        embed_out,
+    )
 
 if __name__ == "__main__":
     demo.launch()
