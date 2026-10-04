@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import warnings
@@ -12,11 +13,9 @@ from .answer_cache import get_answer_cache
 from .documents import get_document_store
 from .chain import step, stop
 from .prompt import EXTRACT_SYSTEM, looks_like_persona, parse_slots, render_output
-from tools.weather import WeatherTool
-from .tools import run_tool
+from tools import TOOL_MAP, TOOLS
 
 logger = logging.getLogger("agent")
-_weather = WeatherTool()
 if not logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
@@ -24,45 +23,58 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-SYSTEM_PROMPT = """你是一个可用工具的 AI Agent。
-可用工具：
-- get_current_time: 获取当前时间（无参数）
-
-只有用户明确询问当前时间或日期时，才只回复一行：TOOL:get_current_time
-其他问题直接回答。禁止在回答中出现 TOOL、工具名或调用过程。"""
-
-_TOOL_CALL = re.compile(r"^\s*TOOL\s*[:：]\s*([A-Za-z0-9_]+)\s*$", re.I)
-_TOOL_MENTION = re.compile(r"TOOL\s*[:：]\s*[A-Za-z0-9_]+", re.I)
-_TIME_QUERY = re.compile(r"几点|时间|日期|今天几号|现在是")
+SYSTEM_PROMPT = "你是一个 AI Agent。直接用自然语言回答。不要提及工具名或 JSON。"
 
 
-def _tool_name(text: str) -> str | None:
-    match = _TOOL_CALL.match((text or "").strip())
-    return match.group(1) if match else None
+def _schema(tool) -> dict:
+    raw = tool.args_schema.model_json_schema()
+    return {
+        "type": "object",
+        "properties": raw.get("properties") or {},
+        "required": raw.get("required") or [],
+    }
 
 
-def _pending_tool(text: str) -> bool:
-    stripped = (text or "").strip()
-    if not stripped or _tool_name(stripped):
-        return True
-    return any(prefix.startswith(stripped) for prefix in ("TOOL:", "TOOL：", "tool:", "tool："))
+def _decide_prompt() -> str:
+    lines = [
+        "根据用户问题决定是否调用工具。只输出一个 JSON 对象，不要输出其他文字。",
+        '不需要工具时输出：{"tool": null}',
+        '需要工具时输出：{"tool": "工具名", "args": {参数}}',
+        "可用工具：",
+    ]
+    for item in TOOLS:
+        lines.append(f"- {item.name}: {item.description}")
+        lines.append(f"  参数: {json.dumps(_schema(item), ensure_ascii=False)}")
+    return "\n".join(lines)
 
 
-def _visible_text(text: str) -> str:
-    kept = []
-    for line in (text or "").splitlines():
-        if _tool_name(line) or _TOOL_MENTION.search(line):
-            cleaned = _TOOL_MENTION.sub("", line).strip(" ，,。")
-            if cleaned:
-                kept.append(cleaned)
-            continue
-        if line.strip():
-            kept.append(line.strip())
-    return "\n".join(kept).strip()
+DECIDE_PROMPT = _decide_prompt()
 
 
-def _asks_time(text: str) -> bool:
-    return bool(_TIME_QUERY.search(text or ""))
+def _parse_tool_call(raw: str) -> tuple[str, dict] | None:
+    text = (raw or "").strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
+    if fenced:
+        text = fenced.group(1)
+    else:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        text = text[start : end + 1]
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    name = data.get("tool")
+    if not name or name not in TOOL_MAP:
+        return None
+    args = data.get("args") or {}
+    if not isinstance(args, dict):
+        return None
+    return str(name), args
 
 
 def _call(ctx, messages, temperature, max_tokens):
@@ -185,16 +197,25 @@ class Agent:
         text = ""
         for delta in self._stream_chat():
             text += delta
-            if _pending_tool(text):
-                continue
-            shown = _visible_text(text)
-            if shown:
-                yield shown
+            if text.strip():
+                yield text
         return text
 
+    def _decide_tool(self, user_input: str) -> tuple[str, dict] | None:
+        raw = llm.chat(
+            [
+                {"role": "system", "content": DECIDE_PROMPT},
+                {"role": "user", "content": user_input},
+            ],
+            provider=self.provider,
+            model=self.model,
+            temperature=0,
+            max_tokens=256,
+        )
+        logger.info("工具决定: %s", raw)
+        return _parse_tool_call(raw)
+
     def _reuse_answer(self, user_input: str) -> str | None:
-        if _asks_time(user_input) or _weather.matches(user_input):
-            return None
         try:
             found = get_answer_cache().lookup(user_input)
         except Exception as exc:
@@ -209,7 +230,7 @@ class Agent:
         return answer
 
     def _store_answer(self, user_input: str, reply: str) -> None:
-        if _asks_time(user_input) or _weather.matches(user_input) or reply.startswith("错误"):
+        if reply.startswith("错误"):
             return
         try:
             get_answer_cache().add(user_input, reply)
@@ -226,11 +247,23 @@ class Agent:
     def stream(self, user_input: str):
         logger.info("输入: %s", user_input)
         try:
-            if _weather.matches(user_input):
-                reply = _weather.answer(user_input)
-                self.remember(user_input, reply)
-                self._log_output(reply)
-                yield reply
+            decision = self._decide_tool(user_input)
+            if decision:
+                name, args = decision
+                logger.info("调用工具: %s %s", name, args)
+                result = TOOL_MAP[name].invoke(args)
+                self._turn.append({"role": "user", "content": user_input})
+                self._turn.append(
+                    {
+                        "role": "user",
+                        "content": f"工具结果：{result}。请直接用自然语言回答用户，不要提及工具名或 JSON。",
+                    }
+                )
+                text = yield from self._stream_visible()
+                shown = (text or "").strip() or str(result)
+                yield shown
+                self.remember(user_input, shown)
+                self._log_output(shown)
                 return
             context = self._document_context(user_input)
             if not context:
@@ -250,22 +283,7 @@ class Agent:
                 prompt = f"{user_input}\n\n参考文档片段：\n{context}"
             self._turn.append({"role": "user", "content": prompt})
             text = yield from self._stream_visible()
-            tool = _tool_name(text)
-            if tool == "get_current_time" and _asks_time(user_input):
-                result = run_tool(tool)
-                self._turn.append(
-                    {
-                        "role": "user",
-                        "content": f"当前时间是 {result}。请直接回答用户，不要提及工具或 TOOL。",
-                    }
-                )
-                text = yield from self._stream_visible()
-            elif tool:
-                self._turn.append(
-                    {"role": "user", "content": "不要调用任何工具，直接用自然语言回答。"}
-                )
-                text = yield from self._stream_visible()
-            shown = _visible_text(text) or "请换种说法再试一次。"
+            shown = (text or "").strip() or "请换种说法再试一次。"
             yield shown
             self.remember(user_input, shown)
             if not context:
