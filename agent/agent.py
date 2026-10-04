@@ -12,9 +12,11 @@ from .answer_cache import get_answer_cache
 from .documents import get_document_store
 from .chain import step, stop
 from .prompt import EXTRACT_SYSTEM, looks_like_persona, parse_slots, render_output
+from tools.weather import WeatherTool
 from .tools import run_tool
 
 logger = logging.getLogger("agent")
+_weather = WeatherTool()
 if not logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
@@ -191,7 +193,7 @@ class Agent:
         return text
 
     def _reuse_answer(self, user_input: str) -> str | None:
-        if _asks_time(user_input):
+        if _asks_time(user_input) or _weather.matches(user_input):
             return None
         try:
             found = get_answer_cache().lookup(user_input)
@@ -207,7 +209,7 @@ class Agent:
         return answer
 
     def _store_answer(self, user_input: str, reply: str) -> None:
-        if _asks_time(user_input) or reply.startswith("错误"):
+        if _asks_time(user_input) or _weather.matches(user_input) or reply.startswith("错误"):
             return
         try:
             get_answer_cache().add(user_input, reply)
@@ -224,6 +226,12 @@ class Agent:
     def stream(self, user_input: str):
         logger.info("输入: %s", user_input)
         try:
+            if _weather.matches(user_input):
+                reply = _weather.answer(user_input)
+                self.remember(user_input, reply)
+                self._log_output(reply)
+                yield reply
+                return
             context = self._document_context(user_input)
             if not context:
                 reused = self._reuse_answer(user_input)
