@@ -25,11 +25,11 @@ PROVIDERS = {
 }
 
 MODEL_CHOICES = {
+    "Ollama / qwen2.5:3b": ("ollama", "qwen2.5:3b"),
     "百炼 / qwen-plus": ("bailian", "qwen-plus"),
     "百炼 / qwen-max": ("bailian", "qwen-max"),
     "OpenAI / gpt-4o-mini": ("openai", "gpt-4o-mini"),
     "OpenAI / gpt-4o": ("openai", "gpt-4o"),
-    "Ollama / qwen2.5:3b": ("ollama", "qwen2.5:3b"),
 }
 
 STATUS_MESSAGES = {

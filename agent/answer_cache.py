@@ -5,6 +5,7 @@ from pathlib import Path
 from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
 
+from .embedding_guard import disable_embeddings, embeddings_enabled, note_embedding_error
 from .embeddings import get_embeddings
 
 logger = logging.getLogger("agent")
@@ -21,10 +22,14 @@ class AnswerCache:
         self._load()
 
     def lookup(self, question: str) -> tuple[str, float] | None:
-        if not self.store.store:
-            logger.info("向量库为空，调用模型")
+        if not self.store.store or not embeddings_enabled():
             return None
-        hits = self.store.similarity_search_with_score(question, k=1)
+        try:
+            hits = self.store.similarity_search_with_score(question, k=1)
+        except Exception as exc:
+            note_embedding_error(exc)
+            disable_embeddings()
+            return None
         if not hits:
             return None
         doc, score = hits[0]
@@ -34,11 +39,17 @@ class AnswerCache:
         return str(doc.metadata.get("answer") or ""), float(score)
 
     def add(self, question: str, answer: str) -> None:
-        self.store.add_documents(
-            [Document(page_content=question, metadata={"answer": answer})]
-        )
-        self._save()
-        logger.info("写入向量库: %s", question)
+        if not embeddings_enabled():
+            return
+        try:
+            self.store.add_documents(
+                [Document(page_content=question, metadata={"answer": answer})]
+            )
+            self._save()
+            logger.info("写入向量库: %s", question)
+        except Exception as exc:
+            note_embedding_error(exc)
+            disable_embeddings()
 
     def _load(self) -> None:
         if not CACHE_PATH.exists():
@@ -46,7 +57,8 @@ class AnswerCache:
         items = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
         for item in items:
             self.store.store[item["id"]] = item
-        logger.info("已加载向量库 %s 条", len(items))
+        if items:
+            logger.info("已加载答案复用库 %s 条", len(items))
 
     def _save(self) -> None:
         CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
