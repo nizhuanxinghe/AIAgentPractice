@@ -6,6 +6,7 @@ from langchain_community.document_loaders import TextLoader
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from .embedding_guard import disable_embeddings, embeddings_enabled, note_embedding_error
 from .embeddings import get_embeddings
 
 logger = logging.getLogger("agent")
@@ -47,9 +48,14 @@ class DocumentStore:
         return len(chunks)
 
     def context(self, query: str) -> str:
-        if not self.store.store:
+        if not self.store.store or not embeddings_enabled():
             return ""
-        hits = self.store.similarity_search_with_score(query, k=TOP_K)
+        try:
+            hits = self.store.similarity_search_with_score(query, k=TOP_K)
+        except Exception as exc:
+            note_embedding_error(exc)
+            disable_embeddings()
+            return ""
         texts: list[str] = []
         if hits and hits[0][1] >= SCORE_FLOOR:
             logger.info("文档检索 最高相似度: %.3f", hits[0][1])
@@ -82,7 +88,8 @@ class DocumentStore:
         items = json.loads(STORE_PATH.read_text(encoding="utf-8"))
         for item in items:
             self.store.store[item["id"]] = item
-        logger.info("已加载文档向量库 %s 条", len(items))
+        if items:
+            logger.info("已加载文档向量库 %s 条", len(items))
 
     def _save(self) -> None:
         STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
